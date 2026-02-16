@@ -142,6 +142,12 @@ Date: {date.today().isoformat()}
 3. Reviewer validates spec and quality before status changes to complete.
 4. Lead records decision and next action in this brief.
 
+## Debate and Reflection Protocol
+1. For conflicting approaches, open a formal debate linked to the blocked task.
+2. Require one position per debate member with option, rationale, and confidence.
+3. Decide with explicit rationale, then apply outcome to task status/owner.
+4. Broadcast the chosen path and resume implementation on the linked task.
+
 ## Decision Log
 - [ ] Decision:
   Context:

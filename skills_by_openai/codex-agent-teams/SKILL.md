@@ -13,6 +13,8 @@ This skill mirrors documented Anthropic patterns such as:
 - shared task list with `pending`, `in_progress`, `completed`
 - teammates claiming independent tasks
 - direct teammate messaging and broadcasts
+- explicit debate lifecycle (`start-debate` -> `add-position` -> `decide`/`apply`)
+- automatic debate loop orchestration with decision-to-task reflection
 - explicit approval checkpoints before implementation
 - delegate mode where lead coordinates and does not code
 
@@ -147,6 +149,138 @@ List task board:
 python3 scripts/team_ops.py list-tasks --team-name "<team-name>"
 ```
 
+## Debate Protocol (Conflict to Decision)
+
+When two or more approaches conflict, run a formal debate and persist the outcome.
+Debates are stored in `.codex/teams/<team-name>/debates.json`.
+
+Start a debate:
+
+```bash
+python3 scripts/team_ops.py start-debate \
+  --team-name "<team-name>" \
+  --topic "Choose retry strategy for API sync" \
+  --task-id "task-2" \
+  --options "fixed-backoff,exponential-backoff" \
+  --members "implementer-a,implementer-b,reviewer" \
+  --decider "lead" \
+  --notify
+```
+
+Each member submits a position:
+
+```bash
+python3 scripts/team_ops.py add-position \
+  --team-name "<team-name>" \
+  --debate-id "debate-1" \
+  --member "implementer-a" \
+  --option "exponential-backoff" \
+  --confidence 0.8 \
+  --rationale "Lower p95 under burst failures."
+```
+
+Lead decides and applies to the linked task:
+
+```bash
+python3 scripts/team_ops.py decide-debate \
+  --team-name "<team-name>" \
+  --debate-id "debate-1" \
+  --rationale "Best reliability/cost tradeoff from submitted evidence." \
+  --require-all-positions \
+  --apply \
+  --status-on-apply "in_progress" \
+  --owner-map "fixed-backoff:implementer-a,exponential-backoff:implementer-b"
+```
+
+Review debate state:
+
+```bash
+python3 scripts/team_ops.py list-debates --team-name "<team-name>"
+python3 scripts/team_ops.py show-debate --team-name "<team-name>" --debate-id "debate-1"
+```
+
+## Automatic Orchestration Loop
+
+Use one command to run the loop:
+1. create/load debate
+2. remind missing members
+3. auto-decide when all positions are present (weighted confidence)
+4. reflect decision into linked task (`status`, optional owner mapping, note, broadcast)
+
+```bash
+python3 scripts/team_ops.py orchestrate-debate \
+  --team-name "<team-name>" \
+  --topic "Choose cache invalidation strategy" \
+  --task-id "task-4" \
+  --options "ttl-only,event-driven" \
+  --members "implementer-a,implementer-b,reviewer" \
+  --decider "lead" \
+  --send-reminders \
+  --status-on-apply "in_progress" \
+  --owner-map "ttl-only:implementer-a,event-driven:implementer-b"
+```
+
+Re-run `orchestrate-debate` until applied. It is idempotent once a decision is applied.
+
+## Monitoring (Optional, Default OFF)
+
+`team_ops.py` supports opt-in monitor logging for command-level observability.
+Monitoring is disabled by default and no monitor file is created unless explicitly enabled.
+
+Enable monitoring for a command:
+
+```bash
+python3 scripts/team_ops.py orchestrate-debate \
+  --team-name "<team-name>" \
+  --debate-id "debate-1" \
+  --monitoring
+```
+
+Override monitor file path:
+
+```bash
+python3 scripts/team_ops.py update-task \
+  --team-name "<team-name>" \
+  --task-id "task-1" \
+  --status "completed" \
+  --monitoring \
+  --monitor-log-file "/tmp/team-monitor.jsonl"
+```
+
+Environment alternatives:
+- `TEAM_OPS_MONITORING=1`
+- `TEAM_OPS_MONITOR_LOG_FILE=/path/to/monitor.jsonl`
+
+Generate monitor summary report:
+
+```bash
+python3 scripts/team_ops.py monitor-report \
+  --team-name "<team-name>" \
+  --output ".codex/teams/<team-name>/monitor-report.json"
+```
+
+Monitoring event schema (`monitor.jsonl`, one JSON object per line):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `at` | string (ISO-8601 UTC) | Event timestamp |
+| `event_type` | string | Event name (for example `message.sent`, `debate.started`, `debate.applied`, `task.updated`) |
+| `command` | string | `team_ops.py` command that emitted the event |
+| `team_name` | string | Team identifier |
+| `actor` | string | Member or system actor that performed the action |
+| `entity_type` | string | Domain object type (`team`, `task`, `debate`, `message`) |
+| `entity_id` | string | Object identifier (`task-1`, `debate-2`, `lead->reviewer`) |
+| `before` | object or `null` | Snapshot before change (when applicable) |
+| `after` | object or `null` | Snapshot after change (when applicable) |
+| `metadata` | object | Additional event context (option, rationale, missing members, etc.) |
+| `correlation_id` | string | Correlation id to group related command runs |
+
+Example line:
+
+```json
+{"at":"2026-02-16T06:00:00+00:00","event_type":"debate.applied","command":"apply-decision","team_name":"example-team","actor":"lead","entity_type":"debate","entity_id":"debate-1","before":{"task":{"owner":"unassigned","status":"pending"}},"after":{"task":{"owner":"implementer-a","status":"in_progress"}},"metadata":{"task_id":"task-1","option":"session"},"correlation_id":"2e5db8f0d25d4f08b6f2f4f13a4ed8ad"}
+```
+
 ## Superpowers Integration
 
 Map workstreams to one control skill:
@@ -175,7 +309,9 @@ Before merging teammate outputs:
 - Keep one source of truth for status in team task board.
 - Do not mark task complete without command output.
 - Escalate unresolved blockers after two failed attempts.
-- If two solutions conflict, dispatch a challenger reviewer and record decision.
+- If two solutions conflict, start a debate and link it to the blocked task.
+- Do not close debates without recorded rationale and selected option.
+- Reflect debate outcomes into task state before resuming implementation.
 
 ## Limitations
 
@@ -187,7 +323,7 @@ This skill emulates Agent Teams patterns in Codex, but some native Anthropic UX 
 ## Resources
 
 - `scripts/create_team_brief.py`: generate a reusable team charter and task board.
-- `scripts/team_ops.py`: manage team members, task states, dependencies, and mailbox.
+- `scripts/team_ops.py`: manage team members, task states, mailbox, debates, and auto-orchestration.
 - `references/anthropic-pattern-map.md`: what is mirrored from Anthropic docs.
 - `references/team-topologies.md`: choose collaboration pattern by coupling and risk profile.
 - `references/prompt-templates.md`: copy/paste lead, specialist, reviewer, and challenger prompts.

@@ -39,6 +39,9 @@ Risks:
 - Extra cost from duplicate work
 - Needs explicit adjudication criteria
 
+Execution note:
+- Use `start-debate`/`add-position` and finish with `decide-debate --apply` (or `orchestrate-debate`).
+
 ## parallel-pods
 
 Use when several subsystems can be changed independently with minimal overlap.

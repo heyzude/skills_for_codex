@@ -81,3 +81,40 @@ Provide:
 3) Decision criteria to choose between options
 4) Recommendation with explicit tradeoff
 ```
+
+## Debate Position Assignment
+
+```text
+You are debating under debate id: {debate_id}.
+
+Topic:
+{topic}
+
+Options:
+{options}
+
+Rules:
+1) Pick exactly one option from the list.
+2) Provide the strongest argument for your pick.
+3) Name one critical risk in your own pick.
+4) Give confidence from 0.0 to 1.0.
+5) Keep rationale concise and evidence-based.
+
+Output schema:
+- option: <one option string>
+- confidence: <0.0-1.0>
+- rationale: <short paragraph>
+```
+
+## Decision Reflection Notice
+
+```text
+Debate resolved.
+
+Include:
+1) debate id and chosen option
+2) rationale in one paragraph
+3) mapped implementation owner (if any)
+4) task status transition (pending/in_progress/completed)
+5) explicit next command teammate should run
+```
