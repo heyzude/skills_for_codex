@@ -57,6 +57,20 @@ DEFAULT_SKILLS = [
 ]
 
 
+def validate_team_name(team_name: str) -> str:
+    if not isinstance(team_name, str) or not team_name:
+        raise SystemExit("--team-name must be a non-empty string.")
+    if team_name in {".", ".."} or "/" in team_name or "\\" in team_name:
+        raise SystemExit(
+            "--team-name must be a single identifier and cannot contain path separators or traversal segments."
+        )
+    if team_name.strip() != team_name or any(ch.isspace() for ch in team_name):
+        raise SystemExit("--team-name cannot contain whitespace.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in team_name):
+        raise SystemExit("--team-name cannot contain control characters.")
+    return team_name
+
+
 def parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
@@ -215,6 +229,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.team_name = validate_team_name(args.team_name)
 
     workstreams = parse_csv(args.workstreams)
     roles = parse_csv(args.roles)
@@ -244,8 +259,22 @@ def main() -> int:
 
     if args.output:
         output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(content, encoding="utf-8")
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit(
+                f"Unable to prepare output directory at {output_path.parent}: {exc.strerror or exc}."
+            ) from exc
+        if output_path.exists() and output_path.is_dir():
+            raise SystemExit(
+                f"Cannot write output file: {output_path} is a directory, expected a file path."
+            )
+        try:
+            output_path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(
+                f"Unable to write output file at {output_path}: {exc.strerror or exc}."
+            ) from exc
     else:
         print(content)
 

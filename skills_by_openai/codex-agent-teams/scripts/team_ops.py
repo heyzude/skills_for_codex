@@ -12,8 +12,16 @@ Provides simple shared-state primitives:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import difflib
 import json
+import math
 import os
+import re
+import shutil
+import sys
+import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,10 +31,49 @@ TASK_STATUSES = {"pending", "in_progress", "completed"}
 DEBATE_STATUSES = {"open", "decided", "applied"}
 MONITORING_ENV = "TEAM_OPS_MONITORING"
 MONITOR_LOG_ENV = "TEAM_OPS_MONITOR_LOG_FILE"
+TEAM_ROOT_ENV = "TEAM_OPS_ROOT"
+UNASSIGNED_OWNER = "unassigned"
+TEAM_ROOT_IS_EXPLICIT = False
+LOCK_WAIT_ENV = "TEAM_OPS_LOCK_WAIT_SECONDS"
+LOCK_STALE_ENV = "TEAM_OPS_LOCK_STALE_SECONDS"
+DEFAULT_LOCK_WAIT_SECONDS = 15.0
+DEFAULT_LOCK_STALE_SECONDS = 300.0
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z") or normalized.endswith("z"):
+        normalized = normalized[:-1] + "+00:00"
+    else:
+        # Accept common ISO-8601 offset variants:
+        # - basic form: +0000 / -0530
+        # - hour-only form: +00 / -05
+        match_hhmm = re.match(
+            r"^(.*[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-]\d{2})(\d{2})$",
+            normalized,
+        )
+        if match_hhmm:
+            normalized = f"{match_hhmm.group(1)}{match_hhmm.group(2)}:{match_hhmm.group(3)}"
+        else:
+            match_hh = re.match(
+                r"^(.*[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-]\d{2})$",
+                normalized,
+            )
+            if match_hh:
+                normalized = f"{match_hh.group(1)}{match_hh.group(2)}:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -49,11 +96,177 @@ def parse_owner_map(value: str | None) -> dict[str, str]:
             raise SystemExit(
                 "--owner-map entries must include both option and owner (option:owner)."
             )
+        if option in mapping:
+            raise SystemExit(
+                f"--owner-map contains duplicate option '{option}'. Provide one owner per option."
+            )
         mapping[option] = owner
     return mapping
 
 
+def discover_workspace_root(start: Path) -> Path:
+    current = start.resolve(strict=False)
+    for candidate in (current, *current.parents):
+        if (candidate / ".codex").is_dir():
+            return candidate
+    return current
+
+
+def resolve_team_root(explicit: str | None) -> Path:
+    configured = explicit or os.getenv(TEAM_ROOT_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    return discover_workspace_root(Path.cwd()) / ".codex" / "teams"
+
+
+def ensure_team_root_usable(path: Path) -> None:
+    if path.exists() and not path.is_dir():
+        raise SystemExit(
+            f"Team root '{path}' is not a directory. "
+            "Set --team-root (or TEAM_OPS_ROOT) to a writable directory path."
+        )
+
+
+def parse_positive_float(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if not math.isfinite(parsed) or parsed <= 0:
+        return default
+    return parsed
+
+
+def team_lock_path(team_name: str) -> Path:
+    return TEAM_ROOT / f".{validate_team_name(team_name)}.lock"
+
+
+def read_lock_pid(lock_path: Path) -> int | None:
+    try:
+        lines = lock_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    try:
+        pid = int(lines[1].strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def process_is_running(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def reclaim_stale_lock(lock_path: Path, *, stale_seconds: float) -> bool:
+    try:
+        observed = lock_path.stat()
+    except OSError:
+        return False
+
+    if (time.time() - observed.st_mtime) <= stale_seconds:
+        return False
+
+    lock_pid = read_lock_pid(lock_path)
+    if process_is_running(lock_pid):
+        return False
+
+    # Avoid deleting a lock that was replaced by another process after our first stat.
+    try:
+        current = lock_path.stat()
+    except OSError:
+        return False
+    if current.st_ino != observed.st_ino or current.st_dev != observed.st_dev:
+        return False
+
+    try:
+        lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def team_state_lock(team_name: str) -> object:
+    lock_path = team_lock_path(team_name)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to prepare team lock directory at {lock_path.parent}: {exc.strerror or exc}."
+        ) from exc
+
+    wait_seconds = parse_positive_float(
+        os.getenv(LOCK_WAIT_ENV), DEFAULT_LOCK_WAIT_SECONDS
+    )
+    stale_seconds = parse_positive_float(
+        os.getenv(LOCK_STALE_ENV), DEFAULT_LOCK_STALE_SECONDS
+    )
+    start = time.monotonic()
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if reclaim_stale_lock(lock_path, stale_seconds=stale_seconds):
+                continue
+            if (time.monotonic() - start) >= wait_seconds:
+                raise SystemExit(
+                    f"Timed out waiting for team lock at {lock_path}. "
+                    f"Another command may still be writing state. Retry, or tune {LOCK_WAIT_ENV}."
+                )
+            time.sleep(0.05)
+            continue
+        except OSError as exc:
+            raise SystemExit(
+                f"Unable to acquire team lock at {lock_path}: {exc.strerror or exc}."
+            ) from exc
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{time.time()}\n{os.getpid()}\n")
+            yield
+        finally:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise SystemExit(
+                    f"Unable to release team lock at {lock_path}: {exc.strerror or exc}."
+                ) from exc
+        return
+
+
+def validate_team_name(team_name: str) -> str:
+    if not isinstance(team_name, str) or not team_name:
+        raise SystemExit("--team-name must be a non-empty string.")
+    if team_name in {".", ".."} or "/" in team_name or "\\" in team_name:
+        raise SystemExit(
+            "--team-name must be a single identifier and cannot contain path separators or traversal segments."
+        )
+    if team_name.strip() != team_name or any(ch.isspace() for ch in team_name):
+        raise SystemExit("--team-name cannot contain whitespace.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in team_name):
+        raise SystemExit("--team-name cannot contain control characters.")
+    return team_name
+
+
 def team_dir(team_name: str) -> Path:
+    team_name = validate_team_name(team_name)
     return TEAM_ROOT / team_name
 
 
@@ -73,28 +286,319 @@ def message_file(team_name: str) -> Path:
     return team_dir(team_name) / "messages.jsonl"
 
 
+def monitor_file(team_name: str) -> Path:
+    return team_dir(team_name) / "monitor.jsonl"
+
+
+def discover_team_roots_for_name(team_name: str) -> list[Path]:
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    cwd = Path.cwd().resolve(strict=False)
+    for candidate in (cwd, *cwd.parents):
+        root = candidate / ".codex" / "teams"
+        meta = root / team_name / "team.json"
+        if not meta.is_file():
+            continue
+        normalized = root.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        roots.append(normalized)
+    return roots
+
+
 def require_team(team_name: str) -> None:
-    if not team_file(team_name).exists():
+    global TEAM_ROOT
+    if team_file(team_name).exists():
+        return
+
+    if TEAM_ROOT_IS_EXPLICIT:
         raise SystemExit(
-            f"Team '{team_name}' is not initialized. Run: team_ops.py init --team-name {team_name} ..."
+            f"Team '{team_name}' is not initialized under {TEAM_ROOT}. "
+            f"Run: team_ops.py init --team-name {team_name} ..."
         )
+
+    discovered_roots = discover_team_roots_for_name(team_name)
+    if len(discovered_roots) == 1:
+        fallback_root = discovered_roots[0]
+        previous_root = TEAM_ROOT
+        TEAM_ROOT = fallback_root
+        if team_file(team_name).exists():
+            print(
+                f"Warning: Team '{team_name}' was not found under {previous_root}. "
+                f"Auto-switched --team-root to {fallback_root}.",
+                file=sys.stderr,
+            )
+            return
+        TEAM_ROOT = previous_root
+
+    if len(discovered_roots) > 1:
+        raise SystemExit(
+            f"Team '{team_name}' is not initialized under {TEAM_ROOT}. "
+            "Found the same team name in multiple ancestor roots: "
+            + ", ".join(str(root) for root in discovered_roots)
+            + ". Pass --team-root explicitly."
+        )
+
+    raise SystemExit(
+        f"Team '{team_name}' is not initialized under {TEAM_ROOT}. "
+        f"Run: team_ops.py init --team-name {team_name} ..."
+    )
+
+
+def load_team_state(team_name: str) -> dict[str, object]:
+    require_team(team_name)
+    payload = load_json(team_file(team_name), {})
+    if not isinstance(payload, dict):
+        raise SystemExit(
+            f"Team metadata is corrupted for team '{team_name}': expected JSON object."
+        )
+    return payload
+
+
+def load_team_members(team_name: str) -> list[str]:
+    payload = load_team_state(team_name)
+    members = payload.get("members")
+    if not isinstance(members, list):
+        raise SystemExit(
+            f"Team metadata is corrupted for team '{team_name}': 'members' must be a JSON array."
+        )
+    normalized: list[str] = []
+    for index, member in enumerate(members):
+        if not isinstance(member, str) or not member:
+            raise SystemExit(
+                f"Team metadata is corrupted for team '{team_name}': members[{index}] must be a non-empty string."
+            )
+        normalized.append(member)
+    if len(set(normalized)) != len(normalized):
+        raise SystemExit(
+            f"Team metadata is corrupted for team '{team_name}': duplicate members are not allowed."
+        )
+    return normalized
+
+
+def suggest_closest(value: str, candidates: list[str]) -> str | None:
+    if not value or not candidates:
+        return None
+    matches = difflib.get_close_matches(value, candidates, n=1, cutoff=0.6)
+    if not matches:
+        return None
+    return matches[0]
+
+
+def ensure_registered_member(*, team_name: str, member: str, field_name: str) -> None:
+    members = load_team_members(team_name)
+    if member not in set(members):
+        suggestion = suggest_closest(member, members)
+        suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+        raise SystemExit(
+            f"{field_name} '{member}' is not a registered member of team '{team_name}'. "
+            f"Registered members: {', '.join(members)}.{suggestion_hint}"
+        )
+
+
+def ensure_registered_member_list(*, team_name: str, members: list[str], field_name: str) -> None:
+    registered_members = load_team_members(team_name)
+    team_members = set(registered_members)
+    unknown = sorted({member for member in members if member not in team_members})
+    if unknown:
+        unknown_with_hints: list[str] = []
+        for member in unknown:
+            suggestion = suggest_closest(member, registered_members)
+            if suggestion:
+                unknown_with_hints.append(f"{member} (did you mean {suggestion}?)")
+            else:
+                unknown_with_hints.append(member)
+        raise SystemExit(
+            f"{field_name} includes non-team member(s) for team '{team_name}': "
+            + ", ".join(unknown_with_hints)
+            + f". Registered members: {', '.join(registered_members)}."
+        )
+
+
+def resolve_new_debate_decider(
+    *,
+    team_name: str,
+    requested_decider: str,
+    debate_members: list[str],
+    field_name: str,
+) -> str:
+    registered_members = load_team_members(team_name)
+    registered_set = set(registered_members)
+
+    if requested_decider in registered_set and requested_decider in debate_members:
+        return requested_decider
+
+    # Fail-soft behavior for common omission: default lead not present in roster.
+    if requested_decider == "lead" and "lead" not in registered_set and debate_members:
+        fallback = debate_members[0]
+        if fallback in registered_set:
+            print(
+                f"Warning: {field_name} defaulted to 'lead', but team '{team_name}' has no lead. "
+                f"Using '{fallback}' from debate members. Set {field_name} explicitly to silence this warning.",
+                file=sys.stderr,
+            )
+            return fallback
+
+    if requested_decider not in registered_set:
+        suggestion = suggest_closest(requested_decider, registered_members)
+        suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+        raise SystemExit(
+            f"{field_name} '{requested_decider}' is not a registered member of team '{team_name}'. "
+            f"Registered members: {', '.join(registered_members)}.{suggestion_hint}"
+        )
+
+    if requested_decider not in debate_members:
+        raise SystemExit(
+            f"{field_name} '{requested_decider}' must be one of debate members: "
+            + ", ".join(debate_members)
+        )
+
+    return requested_decider
+
+
+def resolve_notify_sender(
+    *,
+    team_name: str,
+    requested_sender: str,
+    fallback_sender: str,
+    reason: str,
+    required: bool,
+) -> str:
+    if not required:
+        return requested_sender
+
+    members = load_team_members(team_name)
+    member_set = set(members)
+    if requested_sender in member_set:
+        return requested_sender
+
+    # Default notify sender is "lead"; if lead is not in team, fall back to the decider.
+    if requested_sender == "lead" and fallback_sender in member_set:
+        return fallback_sender
+
+    suggestion = suggest_closest(requested_sender, members)
+    suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+    fallback_hint = ""
+    if fallback_sender in member_set:
+        fallback_hint = f" Use --notify-from '{fallback_sender}' to proceed."
+    raise SystemExit(
+        f"--notify-from '{requested_sender}' is not a registered member of team '{team_name}' "
+        f"for {reason}. Registered members: {', '.join(members)}."
+        f"{suggestion_hint}{fallback_hint}"
+    )
 
 
 def load_json(path: Path, default: object) -> object:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    if path.is_dir():
+        raise SystemExit(f"Invalid state path: {path} is a directory, expected a JSON file.")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to read JSON file at {path}: {exc.strerror or exc}."
+        ) from exc
+    try:
+        return json.loads(raw, parse_constant=reject_nonstandard_json_number)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(
+            f"Invalid JSON in {path}. Fix the file or run init --reset for a clean state."
+        ) from exc
+
+
+def write_text_file(path: Path, content: str, *, label: str) -> None:
+    temp_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.is_dir():
+            raise SystemExit(f"Cannot write {label}: {path} is a directory, expected a file.")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to write {label} at {path}: {exc.strerror or exc}."
+        ) from exc
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def read_text_file(path: Path, *, label: str) -> str:
+    if path.is_dir():
+        raise SystemExit(f"Invalid {label} path: {path} is a directory, expected a file.")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to read {label} at {path}: {exc.strerror or exc}."
+        ) from exc
 
 
 def write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Unable to serialize JSON payload for {path}: {exc}.") from exc
+    write_text_file(path, serialized, label="JSON file")
 
 
 def append_jsonl(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to prepare JSONL directory at {path.parent}: {exc.strerror or exc}."
+        ) from exc
+    if path.exists() and path.is_dir():
+        raise SystemExit(f"Cannot append JSONL: {path} is a directory, expected a file.")
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Unable to serialize JSONL payload for {path}: {exc}.") from exc
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(serialized + "\n")
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to append JSONL at {path}: {exc.strerror or exc}."
+        ) from exc
+
+
+def remove_state_path(path: Path, *, label: str) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return
+        if path.is_dir():
+            shutil.rmtree(path)
+            return
+        path.unlink()
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to clear {label} at {path}: {exc.strerror or exc}."
+        ) from exc
+
+
+def reject_nonstandard_json_number(value: str) -> None:
+    raise ValueError(f"Invalid JSON numeric constant '{value}'.")
 
 
 def env_flag_true(name: str) -> bool:
@@ -109,7 +613,7 @@ def resolve_monitor_path(args: argparse.Namespace, team_name: str) -> Path:
     custom = getattr(args, "monitor_log_file", None) or os.getenv(MONITOR_LOG_ENV)
     if custom:
         return Path(custom)
-    return team_dir(team_name) / "monitor.jsonl"
+    return monitor_file(team_name)
 
 
 def log_event(
@@ -145,32 +649,104 @@ def log_event(
 
 def load_task_board(team_name: str) -> dict[str, object]:
     board = load_json(task_file(team_name), {"tasks": [], "next_id": 1})
-    assert isinstance(board, dict)
-    return board
+    if not isinstance(board, dict):
+        raise SystemExit(f"Task board is corrupted for team '{team_name}': expected JSON object.")
+
+    tasks = board.get("tasks", [])
+    if not isinstance(tasks, list):
+        raise SystemExit(
+            f"Task board is corrupted for team '{team_name}': 'tasks' must be a JSON array."
+        )
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise SystemExit(
+                f"Task board is corrupted for team '{team_name}': tasks[{index}] must be an object."
+            )
+
+    next_id = board.get("next_id")
+    if not isinstance(next_id, int) or next_id < 1:
+        max_id = 0
+        for task in tasks:
+            task_id = task.get("id")
+            if not isinstance(task_id, str) or not task_id.startswith("task-"):
+                continue
+            suffix = task_id.removeprefix("task-")
+            if suffix.isdigit():
+                max_id = max(max_id, int(suffix))
+        next_id = max_id + 1 if max_id else 1
+
+    return {"tasks": tasks, "next_id": next_id}
 
 
 def load_debate_board(team_name: str) -> dict[str, object]:
     board = load_json(debate_file(team_name), {"debates": [], "next_id": 1})
-    assert isinstance(board, dict)
-    return board
+    if not isinstance(board, dict):
+        raise SystemExit(
+            f"Debate board is corrupted for team '{team_name}': expected JSON object."
+        )
+
+    debates = board.get("debates", [])
+    if not isinstance(debates, list):
+        raise SystemExit(
+            f"Debate board is corrupted for team '{team_name}': 'debates' must be a JSON array."
+        )
+    for index, debate in enumerate(debates):
+        if not isinstance(debate, dict):
+            raise SystemExit(
+                f"Debate board is corrupted for team '{team_name}': debates[{index}] must be an object."
+            )
+
+    next_id = board.get("next_id")
+    if not isinstance(next_id, int) or next_id < 1:
+        max_id = 0
+        for debate in debates:
+            debate_id = debate.get("id")
+            if not isinstance(debate_id, str) or not debate_id.startswith("debate-"):
+                continue
+            suffix = debate_id.removeprefix("debate-")
+            if suffix.isdigit():
+                max_id = max(max_id, int(suffix))
+        next_id = max_id + 1 if max_id else 1
+
+    return {"debates": debates, "next_id": next_id}
 
 
 def find_task(board: dict[str, object], task_id: str) -> dict[str, object]:
     tasks = board.get("tasks", [])
-    assert isinstance(tasks, list)
+    if not isinstance(tasks, list):
+        raise SystemExit("Task board is corrupted: 'tasks' must be a JSON array.")
+    known_ids: list[str] = []
     for task in tasks:
-        if isinstance(task, dict) and task.get("id") == task_id:
-            return task
-    raise SystemExit(f"Task not found: {task_id}")
+        if not isinstance(task, dict):
+            continue
+        tid = task.get("id")
+        if isinstance(tid, str) and tid:
+            known_ids.append(tid)
+            if tid == task_id:
+                return task
+    suggestion = suggest_closest(task_id, known_ids)
+    suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+    known_text = ", ".join(known_ids) if known_ids else "(none)"
+    raise SystemExit(f"Task not found: {task_id}.{suggestion_hint} Available tasks: {known_text}.")
 
 
 def find_debate(board: dict[str, object], debate_id: str) -> dict[str, object]:
     debates = board.get("debates", [])
-    assert isinstance(debates, list)
+    if not isinstance(debates, list):
+        raise SystemExit("Debate board is corrupted: 'debates' must be a JSON array.")
+    known_ids: list[str] = []
     for debate in debates:
-        if isinstance(debate, dict) and debate.get("id") == debate_id:
-            return debate
-    raise SystemExit(f"Debate not found: {debate_id}")
+        if not isinstance(debate, dict):
+            continue
+        did = debate.get("id")
+        if isinstance(did, str) and did:
+            known_ids.append(did)
+            if did == debate_id:
+                return debate
+    suggestion = suggest_closest(debate_id, known_ids)
+    suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+    known_text = ", ".join(known_ids) if known_ids else "(none)"
+    raise SystemExit(f"Debate not found: {debate_id}.{suggestion_hint} Available debates: {known_text}.")
 
 
 def latest_positions(debate: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -190,9 +766,15 @@ def latest_positions(debate: dict[str, object]) -> dict[str, dict[str, object]]:
 def choose_decision(
     debate: dict[str, object],
 ) -> tuple[str, str, dict[str, float], dict[str, dict[str, object]]]:
-    options = debate.get("options", [])
-    assert isinstance(options, list)
-    option_set = {opt for opt in options if isinstance(opt, str)}
+    debate_id = debate.get("id")
+    if not isinstance(debate_id, str) or not debate_id:
+        debate_id = "<unknown>"
+    options = require_string_list(
+        debate.get("options", []),
+        field_name="options",
+        context=f"Debate {debate_id}",
+    )
+    option_set = {opt for opt in options}
     if not option_set:
         raise SystemExit("Debate has no options to decide from.")
 
@@ -233,6 +815,58 @@ def ensure_valid_task_status(status: str) -> None:
         raise SystemExit(f"status must be one of: {', '.join(sorted(TASK_STATUSES))}")
 
 
+def require_string_list(value: object, *, field_name: str, context: str) -> list[str]:
+    if not isinstance(value, list):
+        raise SystemExit(f"{context} is corrupted: '{field_name}' must be a JSON array.")
+    output: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise SystemExit(
+                f"{context} is corrupted: {field_name}[{index}] must be a non-empty string."
+            )
+        output.append(item)
+    return output
+
+
+def validate_owner_map(
+    owner_map: dict[str, str], *, options: list[str], allowed_owners: list[str], context: str
+) -> None:
+    option_set = set(options)
+    owner_set = set(allowed_owners)
+
+    unknown_options = sorted(option for option in owner_map if option not in option_set)
+    if unknown_options:
+        raise SystemExit(
+            f"--owner-map has unknown option(s) for {context}: {', '.join(unknown_options)}"
+        )
+
+    invalid_owners = sorted({
+        owner for owner in owner_map.values() if owner not in owner_set and owner != UNASSIGNED_OWNER
+    })
+    if invalid_owners:
+        owners_with_hints: list[str] = []
+        for owner in invalid_owners:
+            suggestion = suggest_closest(owner, allowed_owners)
+            if suggestion:
+                owners_with_hints.append(f"{owner} (did you mean {suggestion}?)")
+            else:
+                owners_with_hints.append(owner)
+        raise SystemExit(
+            f"--owner-map has owner(s) not in team members for {context}: "
+            + ", ".join(owners_with_hints)
+            + f". Registered members: {', '.join(allowed_owners)} (or '{UNASSIGNED_OWNER}')."
+        )
+
+
+def ensure_new_debate_shape(*, options: list[str], members: list[str]) -> None:
+    unique_options = {option for option in options}
+    unique_members = {member for member in members}
+    if len(unique_options) < 2:
+        raise SystemExit("--options must include at least two unique values.")
+    if len(unique_members) < 2:
+        raise SystemExit("--members must include at least two unique registered members.")
+
+
 def create_debate(
     team_name: str,
     topic: str,
@@ -241,22 +875,30 @@ def create_debate(
     members: list[str],
     decider: str,
 ) -> dict[str, object]:
-    if len(options) < 2:
-        raise SystemExit("Debate requires at least two options.")
-    if len(members) < 2:
-        raise SystemExit("Debate requires at least two members.")
+    normalized_options = sorted(set(options))
+    normalized_members = sorted(set(members))
+    normalized_task_id = task_id.strip() if isinstance(task_id, str) else ""
+    if not normalized_task_id:
+        normalized_task_id = None
 
-    if task_id:
-        find_task(load_task_board(team_name), task_id)
+    if len(normalized_options) < 2:
+        raise SystemExit("Debate requires at least two options.")
+    if len(normalized_members) < 2:
+        raise SystemExit("Debate requires at least two members.")
+    if decider not in normalized_members:
+        raise SystemExit("--decider must be one of the registered debate members.")
+
+    if normalized_task_id:
+        find_task(load_task_board(team_name), normalized_task_id)
 
     board = load_debate_board(team_name)
     debate_id = f"debate-{board['next_id']}"
     debate = {
         "id": debate_id,
         "topic": topic,
-        "task_id": task_id,
-        "options": sorted(set(options)),
-        "members": sorted(set(members)),
+        "task_id": normalized_task_id,
+        "options": normalized_options,
+        "members": normalized_members,
         "decider": decider,
         "status": "open",
         "positions": [],
@@ -266,7 +908,10 @@ def create_debate(
         "updated_at": utc_now(),
     }
     debates = board.get("debates")
-    assert isinstance(debates, list)
+    if not isinstance(debates, list):
+        raise SystemExit(
+            f"Debate board is corrupted for team '{team_name}': 'debates' must be a JSON array."
+        )
     debates.append(debate)
     board["next_id"] += 1
     write_json(debate_file(team_name), board)
@@ -376,8 +1021,63 @@ def cmd_init(args: argparse.Namespace) -> None:
     members = [m.strip() for m in args.members.split(",") if m.strip()]
     if not members:
         raise SystemExit("--members must include at least one member.")
+    if len(set(members)) != len(members):
+        raise SystemExit("--members must not contain duplicates.")
     tdir = team_dir(args.team_name)
-    tdir.mkdir(parents=True, exist_ok=True)
+    team_path_conflict = tdir.exists() and not tdir.is_dir()
+    team_meta_path = team_file(args.team_name)
+    team_meta_exists = team_meta_path.exists() or team_meta_path.is_symlink()
+    team_meta_usable = team_meta_path.is_file()
+    team_meta_corrupted = False
+    if team_meta_usable:
+        try:
+            load_team_members(args.team_name)
+        except SystemExit:
+            team_meta_corrupted = True
+            team_meta_usable = False
+    sidecar_state_exists = any(
+        path.exists() or path.is_symlink()
+        for path in (
+            task_file(args.team_name),
+            debate_file(args.team_name),
+            message_file(args.team_name),
+            monitor_file(args.team_name),
+        )
+    )
+    existing_state = team_meta_exists or sidecar_state_exists or team_path_conflict
+    recovering_partial_state = (
+        (existing_state and not team_meta_usable)
+        or team_meta_corrupted
+        or team_path_conflict
+    )
+    if team_meta_usable and not args.reset:
+        print(
+            f"Team '{args.team_name}' already exists at {tdir}. "
+            "No changes made. Re-run with --reset to reinitialize."
+        )
+        return
+    if recovering_partial_state and not args.reset:
+        print(
+            f"Team '{args.team_name}' has partial or corrupted state at {tdir}. "
+            "Reinitializing and clearing stale state."
+        )
+    if args.reset or recovering_partial_state:
+        for path in (
+            team_file(args.team_name),
+            task_file(args.team_name),
+            debate_file(args.team_name),
+            message_file(args.team_name),
+            monitor_file(args.team_name),
+        ):
+            remove_state_path(path, label="team state path")
+        if team_path_conflict:
+            remove_state_path(tdir, label="team directory path")
+    try:
+        tdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"Unable to prepare team directory at {tdir}: {exc.strerror or exc}."
+        ) from exc
     team_payload = {
         "team_name": args.team_name,
         "goal": args.goal,
@@ -387,24 +1087,50 @@ def cmd_init(args: argparse.Namespace) -> None:
     write_json(team_file(args.team_name), team_payload)
     write_json(task_file(args.team_name), {"tasks": [], "next_id": 1})
     write_json(debate_file(args.team_name), {"debates": [], "next_id": 1})
-    message_file(args.team_name).touch(exist_ok=True)
+    write_text_file(message_file(args.team_name), "", label="message log")
+    if (args.reset or recovering_partial_state) and monitor_file(args.team_name).exists():
+        write_text_file(monitor_file(args.team_name), "", label="monitor log")
+    init_event = "team.initialized"
+    init_command = "init"
+    if args.reset and existing_state:
+        init_event = "team.reinitialized"
+        init_command = "init --reset"
+    elif recovering_partial_state:
+        init_event = "team.recovered"
+        init_command = "init (recovery)"
     log_event(
         args,
         team_name=args.team_name,
-        event_type="team.initialized",
-        command="init",
+        event_type=init_event,
+        command=init_command,
         actor="lead",
         entity_type="team",
         entity_id=args.team_name,
-        after={"members": members, "goal": args.goal},
+        after={
+            "members": members,
+            "goal": args.goal,
+            "team_root": str(TEAM_ROOT),
+            "recovered_partial_state": recovering_partial_state,
+        },
     )
-    print(f"Initialized team '{args.team_name}' at {tdir}")
+    if args.reset and existing_state:
+        print(f"Reinitialized team '{args.team_name}' at {tdir}")
+    elif recovering_partial_state:
+        print(f"Recovered team '{args.team_name}' at {tdir}")
+    else:
+        print(f"Initialized team '{args.team_name}' at {tdir}")
 
 
 def cmd_add_task(args: argparse.Namespace) -> None:
     require_team(args.team_name)
     if args.status not in TASK_STATUSES:
         raise SystemExit(f"--status must be one of: {', '.join(sorted(TASK_STATUSES))}")
+    if args.owner != UNASSIGNED_OWNER:
+        ensure_registered_member(
+            team_name=args.team_name,
+            member=args.owner,
+            field_name="--owner",
+        )
     board = load_task_board(args.team_name)
     task_id = f"task-{board['next_id']}"
     depends_on = [d.strip() for d in (args.depends_on or "").split(",") if d.strip()]
@@ -419,7 +1145,10 @@ def cmd_add_task(args: argparse.Namespace) -> None:
         "updated_at": utc_now(),
     }
     tasks = board.get("tasks")
-    assert isinstance(tasks, list)
+    if not isinstance(tasks, list):
+        raise SystemExit(
+            f"Task board is corrupted for team '{args.team_name}': 'tasks' must be a JSON array."
+        )
     tasks.append(task)
     board["next_id"] += 1
     write_json(task_file(args.team_name), board)
@@ -438,6 +1167,11 @@ def cmd_add_task(args: argparse.Namespace) -> None:
 
 def cmd_claim(args: argparse.Namespace) -> None:
     require_team(args.team_name)
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.member,
+        field_name="--member",
+    )
     board = load_task_board(args.team_name)
     task = find_task(board, args.task_id)
     status = task.get("status")
@@ -466,6 +1200,12 @@ def cmd_update_task(args: argparse.Namespace) -> None:
     require_team(args.team_name)
     if args.status:
         ensure_valid_task_status(args.status)
+    if args.owner and args.owner != UNASSIGNED_OWNER:
+        ensure_registered_member(
+            team_name=args.team_name,
+            member=args.owner,
+            field_name="--owner",
+        )
     board = load_task_board(args.team_name)
     task = find_task(board, args.task_id)
     before = {
@@ -512,13 +1252,31 @@ def cmd_list_tasks(args: argparse.Namespace) -> None:
     require_team(args.team_name)
     board = load_task_board(args.team_name)
     tasks = board.get("tasks", [])
-    assert isinstance(tasks, list)
+    if not isinstance(tasks, list):
+        raise SystemExit(
+            f"Task board is corrupted for team '{args.team_name}': 'tasks' must be a JSON array."
+        )
     if not tasks:
         print("No tasks.")
         return
-    for task in tasks:
-        assert isinstance(task, dict)
-        deps = ",".join(task.get("depends_on", [])) if task.get("depends_on") else "-"
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise SystemExit(
+                f"Task board is corrupted for team '{args.team_name}': tasks[{index}] must be an object."
+            )
+        depends_on = task.get("depends_on", [])
+        if not isinstance(depends_on, list):
+            raise SystemExit(
+                f"Task board is corrupted for team '{args.team_name}': "
+                f"tasks[{index}].depends_on must be a JSON array."
+            )
+        for dep_index, dep in enumerate(depends_on):
+            if not isinstance(dep, str) or not dep:
+                raise SystemExit(
+                    f"Task board is corrupted for team '{args.team_name}': "
+                    f"tasks[{index}].depends_on[{dep_index}] must be a non-empty string."
+                )
+        deps = ",".join(depends_on) if depends_on else "-"
         print(
             f"{task.get('id')}  {task.get('status')}  owner={task.get('owner')}  deps={deps}  {task.get('title')}"
         )
@@ -526,6 +1284,16 @@ def cmd_list_tasks(args: argparse.Namespace) -> None:
 
 def cmd_message(args: argparse.Namespace) -> None:
     require_team(args.team_name)
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.sender,
+        field_name="--from",
+    )
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.to,
+        field_name="--to",
+    )
     payload = {
         "at": utc_now(),
         "type": "direct",
@@ -549,6 +1317,11 @@ def cmd_message(args: argparse.Namespace) -> None:
 
 def cmd_broadcast(args: argparse.Namespace) -> None:
     require_team(args.team_name)
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.sender,
+        field_name="--from",
+    )
     payload = {
         "at": utc_now(),
         "type": "broadcast",
@@ -572,19 +1345,39 @@ def cmd_broadcast(args: argparse.Namespace) -> None:
 
 def cmd_inbox(args: argparse.Namespace) -> None:
     require_team(args.team_name)
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.member,
+        field_name="--member",
+    )
     mfile = message_file(args.team_name)
     if not mfile.exists():
         print("No messages.")
         return
-    lines = mfile.read_text(encoding="utf-8").splitlines()
+    lines = read_text_file(
+        mfile,
+        label=f"message log for team '{args.team_name}'",
+    ).splitlines()
     found = False
+    invalid_lines = 0
     for line in lines:
-        payload = json.loads(line)
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line, parse_constant=reject_nonstandard_json_number)
+        except (json.JSONDecodeError, ValueError):
+            invalid_lines += 1
+            continue
+        if not isinstance(payload, dict):
+            invalid_lines += 1
+            continue
         mtype = payload.get("type")
         target = payload.get("to")
         if mtype == "broadcast" or target == args.member:
             found = True
             print(f"[{payload.get('at')}] {payload.get('from')} -> {target}: {payload.get('body')}")
+    if invalid_lines:
+        print(f"Warning: skipped {invalid_lines} invalid message log line(s).")
     if not found:
         print(f"No inbox messages for {args.member}.")
 
@@ -593,7 +1386,26 @@ def cmd_start_debate(args: argparse.Namespace) -> None:
     require_team(args.team_name)
     options = parse_csv(args.options)
     members = parse_csv(args.members)
-    decider = args.decider or "lead"
+    requested_decider = args.decider or "lead"
+    ensure_registered_member_list(
+        team_name=args.team_name,
+        members=members,
+        field_name="--members",
+    )
+    ensure_new_debate_shape(options=options, members=members)
+    decider = resolve_new_debate_decider(
+        team_name=args.team_name,
+        requested_decider=requested_decider,
+        debate_members=members,
+        field_name="--decider",
+    )
+    notify_sender = resolve_notify_sender(
+        team_name=args.team_name,
+        requested_sender=args.notify_from,
+        fallback_sender=decider,
+        reason="start-debate notifications",
+        required=bool(args.notify),
+    )
 
     debate = create_debate(
         team_name=args.team_name,
@@ -611,7 +1423,7 @@ def cmd_start_debate(args: argparse.Namespace) -> None:
                 {
                     "at": utc_now(),
                     "type": "direct",
-                    "from": args.notify_from,
+                    "from": notify_sender,
                     "to": member,
                     "body": (
                         f"Debate {debate['id']} started for topic '{args.topic}'. "
@@ -624,9 +1436,9 @@ def cmd_start_debate(args: argparse.Namespace) -> None:
                 team_name=args.team_name,
                 event_type="message.sent",
                 command="start-debate",
-                actor=args.notify_from,
+                actor=notify_sender,
                 entity_type="message",
-                entity_id=f"{args.notify_from}->{member}",
+                entity_id=f"{notify_sender}->{member}",
                 metadata={"debate_id": debate["id"], "topic": args.topic},
             )
 
@@ -652,24 +1464,40 @@ def cmd_start_debate(args: argparse.Namespace) -> None:
 
 def cmd_add_position(args: argparse.Namespace) -> None:
     require_team(args.team_name)
-    if args.confidence < 0 or args.confidence > 1:
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=args.member,
+        field_name="--member",
+    )
+    if not math.isfinite(args.confidence) or args.confidence < 0 or args.confidence > 1:
         raise SystemExit("--confidence must be between 0 and 1.")
 
     board = load_debate_board(args.team_name)
     debate = find_debate(board, args.debate_id)
 
-    if debate.get("status") not in {"open", "decided"}:
+    if debate.get("status") != "open":
         raise SystemExit(
             f"Debate {args.debate_id} is {debate.get('status')}; cannot add positions."
         )
 
-    members = debate.get("members", [])
-    options = debate.get("options", [])
-    assert isinstance(members, list)
-    assert isinstance(options, list)
+    members = require_string_list(
+        debate.get("members", []),
+        field_name="members",
+        context=f"Debate {args.debate_id}",
+    )
+    options = require_string_list(
+        debate.get("options", []),
+        field_name="options",
+        context=f"Debate {args.debate_id}",
+    )
 
     if args.member not in members:
-        raise SystemExit(f"Member '{args.member}' is not registered for {args.debate_id}.")
+        suggestion = suggest_closest(args.member, members)
+        suggestion_hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+        raise SystemExit(
+            f"--member '{args.member}' is not registered for {args.debate_id}. "
+            f"Debate members: {', '.join(members)}.{suggestion_hint}"
+        )
     if args.option not in options:
         raise SystemExit(
             f"--option must be one of: {', '.join(str(opt) for opt in options)}"
@@ -712,7 +1540,10 @@ def cmd_list_debates(args: argparse.Namespace) -> None:
     require_team(args.team_name)
     board = load_debate_board(args.team_name)
     debates = board.get("debates", [])
-    assert isinstance(debates, list)
+    if not isinstance(debates, list):
+        raise SystemExit(
+            f"Debate board is corrupted for team '{args.team_name}': 'debates' must be a JSON array."
+        )
 
     filtered = []
     for debate in debates:
@@ -728,8 +1559,14 @@ def cmd_list_debates(args: argparse.Namespace) -> None:
         return
 
     for debate in filtered:
-        members = debate.get("members", [])
-        assert isinstance(members, list)
+        debate_id = debate.get("id")
+        if not isinstance(debate_id, str) or not debate_id:
+            debate_id = "<unknown>"
+        members = require_string_list(
+            debate.get("members", []),
+            field_name="members",
+            context=f"Debate {debate_id}",
+        )
         submitted = len(latest_positions(debate))
         print(
             f"{debate.get('id')}  {debate.get('status')}  task={debate.get('task_id') or '-'}  "
@@ -752,6 +1589,8 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
             "team_name": args.team_name,
             "monitor_file": str(monitor_path),
             "events_total": 0,
+            "invalid_event_lines": 0,
+            "other_team_event_lines": 0,
             "message_count": 0,
             "debate_count": 0,
             "debate_applied_count": 0,
@@ -765,10 +1604,57 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
         return
 
     events = []
-    for line in monitor_path.read_text(encoding="utf-8").splitlines():
+    invalid_lines = 0
+    other_team_lines = 0
+    for line in read_text_file(
+        monitor_path,
+        label=f"monitor log for team '{args.team_name}'",
+    ).splitlines():
         if not line.strip():
             continue
-        events.append(json.loads(line))
+        try:
+            payload = json.loads(line, parse_constant=reject_nonstandard_json_number)
+        except (json.JSONDecodeError, ValueError):
+            invalid_lines += 1
+            continue
+        if not isinstance(payload, dict):
+            invalid_lines += 1
+            continue
+        payload_team = payload.get("team_name")
+        if not isinstance(payload_team, str) or not payload_team:
+            invalid_lines += 1
+            continue
+        event_type = payload.get("event_type")
+        command = payload.get("command")
+        actor = payload.get("actor")
+        entity_type = payload.get("entity_type")
+        entity_id = payload.get("entity_id")
+        if not isinstance(event_type, str) or not event_type:
+            invalid_lines += 1
+            continue
+        if not isinstance(command, str) or not command:
+            invalid_lines += 1
+            continue
+        if not isinstance(actor, str) or not actor:
+            invalid_lines += 1
+            continue
+        if not isinstance(entity_type, str) or not entity_type:
+            invalid_lines += 1
+            continue
+        if not isinstance(entity_id, str) or not entity_id:
+            invalid_lines += 1
+            continue
+        at_value = payload.get("at")
+        if not isinstance(at_value, str) or not at_value:
+            invalid_lines += 1
+            continue
+        if parse_iso_datetime(at_value) is None:
+            invalid_lines += 1
+            continue
+        if payload_team != args.team_name:
+            other_team_lines += 1
+            continue
+        events.append(payload)
 
     message_count = 0
     debate_ids: set[str] = set()
@@ -779,8 +1665,8 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
     latencies: list[float] = []
 
     for event in events:
-        etype = str(event.get("event_type"))
-        entity_id = str(event.get("entity_id"))
+        etype = event["event_type"]
+        entity_id = event["entity_id"]
         if etype.startswith("message."):
             message_count += 1
         if etype.startswith("debate."):
@@ -789,20 +1675,17 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
             debate_ids.add(entity_id)
             at_raw = event.get("at")
             if isinstance(at_raw, str):
-                try:
-                    start_times[entity_id] = datetime.fromisoformat(at_raw)
-                except ValueError:
-                    pass
+                parsed = parse_iso_datetime(at_raw)
+                if parsed is not None:
+                    start_times[entity_id] = parsed
         if etype == "debate.applied":
             debate_applied_count += 1
             task_reflection_count += 1
             at_raw = event.get("at")
             if isinstance(at_raw, str) and entity_id in start_times:
-                try:
-                    applied_at = datetime.fromisoformat(at_raw)
+                applied_at = parse_iso_datetime(at_raw)
+                if applied_at is not None:
                     latencies.append((applied_at - start_times[entity_id]).total_seconds())
-                except ValueError:
-                    pass
         if etype == "orchestrate.waiting":
             orchestrate_wait_cycles += 1
 
@@ -810,6 +1693,8 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
         "team_name": args.team_name,
         "monitor_file": str(monitor_path),
         "events_total": len(events),
+        "invalid_event_lines": invalid_lines,
+        "other_team_event_lines": other_team_lines,
         "message_count": message_count,
         "debate_count": len(debate_ids),
         "debate_applied_count": debate_applied_count,
@@ -824,7 +1709,7 @@ def cmd_monitor_report(args: argparse.Namespace) -> None:
 
 def cmd_decide_debate(args: argparse.Namespace) -> None:
     require_team(args.team_name)
-    owner_map = parse_owner_map(args.owner_map)
+    team_members = load_team_members(args.team_name)
     board = load_debate_board(args.team_name)
     debate = find_debate(board, args.debate_id)
 
@@ -833,59 +1718,155 @@ def cmd_decide_debate(args: argparse.Namespace) -> None:
         print(f"{args.debate_id} is already applied.")
         return
 
-    options = debate.get("options", [])
-    assert isinstance(options, list)
-
-    if args.decision:
-        if args.decision not in options:
-            raise SystemExit(
-                f"--decision must be one of: {', '.join(str(opt) for opt in options)}"
-            )
-        selected = args.decision
-        latest = latest_positions(debate)
-        scores = {option: 0.0 for option in options}
-        method = "manual"
-    else:
-        selected, method, scores, latest = choose_decision(debate)
-
-    if args.require_all_positions:
-        members = debate.get("members", [])
-        assert isinstance(members, list)
-        missing = sorted(set(members) - set(latest))
-        if missing:
-            raise SystemExit(
-                "Cannot decide yet; missing positions from: " + ", ".join(missing)
-            )
-
-    debate["decision"] = {
-        "at": utc_now(),
-        "decider": args.decider,
-        "option": selected,
-        "method": method,
-        "scores": scores,
-        "rationale": args.rationale,
-    }
-    debate["status"] = "decided"
-    debate["updated_at"] = utc_now()
-    log_event(
-        args,
+    options = require_string_list(
+        debate.get("options", []),
+        field_name="options",
+        context=f"Debate {args.debate_id}",
+    )
+    members = require_string_list(
+        debate.get("members", []),
+        field_name="members",
+        context=f"Debate {args.debate_id}",
+    )
+    owner_map: dict[str, str] = {}
+    has_linked_task = bool(isinstance(debate.get("task_id"), str) and debate.get("task_id"))
+    if args.apply and has_linked_task:
+        owner_map = parse_owner_map(args.owner_map)
+        validate_owner_map(
+            owner_map,
+            options=options,
+            allowed_owners=team_members,
+            context=f"Debate {args.debate_id}",
+        )
+    configured_decider = debate.get("decider")
+    effective_decider = args.decider
+    if not effective_decider and isinstance(configured_decider, str) and configured_decider:
+        effective_decider = configured_decider
+    if not effective_decider:
+        effective_decider = "lead"
+    ensure_registered_member(
         team_name=args.team_name,
-        event_type="debate.decided",
-        command="decide-debate",
-        actor=args.decider,
-        entity_type="debate",
-        entity_id=args.debate_id,
-        after={
+        member=effective_decider,
+        field_name="--decider",
+    )
+
+    if effective_decider not in members:
+        raise SystemExit("--decider must be one of the registered debate members.")
+    if (
+        isinstance(configured_decider, str)
+        and configured_decider
+        and effective_decider != configured_decider
+    ):
+        raise SystemExit(
+            f"--decider must match debate decider '{configured_decider}' for {args.debate_id}."
+        )
+
+    selected: str
+    method: str
+    scores: dict[str, float]
+    decision_recorded = False
+
+    if status == "decided":
+        existing = debate.get("decision")
+        if not isinstance(existing, dict):
+            raise SystemExit(
+                f"Debate {args.debate_id} is marked decided but has no valid decision payload."
+            )
+        existing_option = existing.get("option")
+        if not isinstance(existing_option, str) or existing_option not in options:
+            raise SystemExit(
+                f"Debate {args.debate_id} has an invalid decided option; cannot proceed."
+            )
+        if args.decision and args.decision != existing_option:
+            raise SystemExit(
+                f"{args.debate_id} is already decided as '{existing_option}'. "
+                "Use the existing decision or open a new debate."
+            )
+        selected = existing_option
+        raw_method = existing.get("method")
+        method = raw_method if isinstance(raw_method, str) and raw_method else "existing"
+        raw_scores = existing.get("scores")
+        scores = raw_scores if isinstance(raw_scores, dict) else {option: 0.0 for option in options}
+
+        if args.require_all_positions:
+            latest = latest_positions(debate)
+            missing = sorted(set(members) - set(latest))
+            if missing:
+                raise SystemExit(
+                    "Cannot apply decided debate yet; missing positions from: "
+                    + ", ".join(missing)
+                )
+
+        if not args.apply:
+            print(
+                f"{args.debate_id} is already decided as '{selected}'. "
+                "Use --apply to reflect that decision to the linked task."
+            )
+            return
+    else:
+        if not args.rationale:
+            raise SystemExit("--rationale is required when finalizing a new debate decision.")
+        if args.decision:
+            if args.decision not in options:
+                raise SystemExit(
+                    f"--decision must be one of: {', '.join(str(opt) for opt in options)}"
+                )
+            selected = args.decision
+            latest = latest_positions(debate)
+            scores = {option: 0.0 for option in options}
+            method = "manual"
+        else:
+            selected, method, scores, latest = choose_decision(debate)
+
+        if args.require_all_positions:
+            missing = sorted(set(members) - set(latest))
+            if missing:
+                raise SystemExit(
+                    "Cannot decide yet; missing positions from: " + ", ".join(missing)
+                )
+
+        debate["decision"] = {
+            "at": utc_now(),
+            "decider": effective_decider,
             "option": selected,
             "method": method,
-            "status": debate["status"],
             "scores": scores,
-        },
-        metadata={"rationale": args.rationale},
-    )
+            "rationale": args.rationale,
+        }
+        debate["status"] = "decided"
+        debate["updated_at"] = utc_now()
+        decision_recorded = True
+        log_event(
+            args,
+            team_name=args.team_name,
+            event_type="debate.decided",
+            command="decide-debate",
+            actor=effective_decider,
+            entity_type="debate",
+            entity_id=args.debate_id,
+            after={
+                "option": selected,
+                "method": method,
+                "status": debate["status"],
+                "scores": scores,
+            },
+            metadata={"rationale": args.rationale},
+        )
 
     apply_note = ""
     if args.apply:
+        will_broadcast_apply = bool(
+            isinstance(debate.get("task_id"), str)
+            and debate.get("task_id")
+            and not debate.get("applied")
+        )
+        notify_sender = resolve_notify_sender(
+            team_name=args.team_name,
+            requested_sender=args.notify_from,
+            fallback_sender=effective_decider,
+            reason="decide-debate apply broadcast",
+            required=will_broadcast_apply,
+        )
         apply_note = apply_decision_to_task(
             args=args,
             team_name=args.team_name,
@@ -893,24 +1874,31 @@ def cmd_decide_debate(args: argparse.Namespace) -> None:
             selected_option=selected,
             selected_status=args.status_on_apply,
             owner_map=owner_map,
-            applied_by=args.decider,
-            sender=args.notify_from,
+            applied_by=effective_decider,
+            sender=notify_sender,
         )
 
     write_json(debate_file(args.team_name), board)
-    print(
-        f"Decided {args.debate_id}: option='{selected}' method={method} "
-        f"status={debate.get('status')}"
-    )
+    if decision_recorded:
+        print(
+            f"Decided {args.debate_id}: option='{selected}' method={method} "
+            f"status={debate.get('status')}"
+        )
+    else:
+        print(
+            f"Applied existing decision for {args.debate_id}: "
+            f"option='{selected}' status={debate.get('status')}"
+        )
     if apply_note:
         print(apply_note)
 
 
 def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
     require_team(args.team_name)
-    owner_map = parse_owner_map(args.owner_map)
+    team_members = load_team_members(args.team_name)
 
     board = load_debate_board(args.team_name)
+    owner_map: dict[str, str] = {}
 
     debate: dict[str, object]
     if args.debate_id:
@@ -918,7 +1906,19 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
     else:
         options = parse_csv(args.options)
         members = parse_csv(args.members)
-        decider = args.decider or "lead"
+        requested_decider = args.decider or "lead"
+        ensure_registered_member_list(
+            team_name=args.team_name,
+            members=members,
+            field_name="--members",
+        )
+        ensure_new_debate_shape(options=options, members=members)
+        decider = resolve_new_debate_decider(
+            team_name=args.team_name,
+            requested_decider=requested_decider,
+            debate_members=members,
+            field_name="--decider",
+        )
         debate = create_debate(
             team_name=args.team_name,
             topic=args.topic,
@@ -951,20 +1951,45 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
         print(f"{debate_id} already applied. Nothing to do.")
         return
 
-    members = debate.get("members", [])
-    assert isinstance(members, list)
+    members = require_string_list(
+        debate.get("members", []),
+        field_name="members",
+        context=f"Debate {debate_id}",
+    )
+    options = require_string_list(
+        debate.get("options", []),
+        field_name="options",
+        context=f"Debate {debate_id}",
+    )
+    effective_decider = str(debate.get("decider") or args.decider or "lead")
+    if effective_decider not in members:
+        raise SystemExit(
+            f"Debate {debate_id} decider '{effective_decider}' is not a registered member."
+        )
+    ensure_registered_member(
+        team_name=args.team_name,
+        member=effective_decider,
+        field_name="--decider",
+    )
     latest = latest_positions(debate)
     missing = sorted(set(members) - set(latest))
 
     if missing:
         if args.send_reminders:
+            notify_sender = resolve_notify_sender(
+                team_name=args.team_name,
+                requested_sender=args.notify_from,
+                fallback_sender=effective_decider,
+                reason="orchestrate-debate reminders",
+                required=True,
+            )
             for member in missing:
                 append_jsonl(
                     message_file(args.team_name),
                     {
                         "at": utc_now(),
                         "type": "direct",
-                        "from": args.notify_from,
+                        "from": notify_sender,
                         "to": member,
                         "body": (
                             f"Debate {debate_id} is waiting for your position. "
@@ -977,9 +2002,9 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
                     team_name=args.team_name,
                     event_type="message.sent",
                     command="orchestrate-debate",
-                    actor=args.notify_from,
+                    actor=notify_sender,
                     entity_type="message",
-                    entity_id=f"{args.notify_from}->{member}",
+                    entity_id=f"{notify_sender}->{member}",
                     metadata={"debate_id": debate_id, "reason": "missing_position"},
                 )
         log_event(
@@ -987,7 +2012,7 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
             team_name=args.team_name,
             event_type="orchestrate.waiting",
             command="orchestrate-debate",
-            actor=args.decider or "lead",
+            actor=effective_decider,
             entity_type="debate",
             entity_id=debate_id,
             metadata={"missing_members": missing},
@@ -1000,7 +2025,7 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
         selected, method, scores, _ = choose_decision(debate)
         debate["decision"] = {
             "at": utc_now(),
-            "decider": debate.get("decider") or args.decider,
+            "decider": effective_decider,
             "option": selected,
             "method": method,
             "scores": scores,
@@ -1014,7 +2039,7 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
             team_name=args.team_name,
             event_type="debate.decided",
             command="orchestrate-debate",
-            actor=str(debate.get("decider") or args.decider or "lead"),
+            actor=effective_decider,
             entity_type="debate",
             entity_id=debate_id,
             after={"option": selected, "method": method, "scores": scores, "status": debate["status"]},
@@ -1022,8 +2047,34 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
         )
 
     selected_option = decision.get("option")
-    if not isinstance(selected_option, str) or not selected_option:
-        raise SystemExit(f"{debate_id} has invalid decision option.")
+    if not isinstance(selected_option, str) or selected_option not in options:
+        raise SystemExit(
+            f"{debate_id} has invalid decision option; expected one of: "
+            + ", ".join(str(option) for option in options)
+        )
+
+    has_linked_task = bool(isinstance(debate.get("task_id"), str) and debate.get("task_id"))
+    if has_linked_task:
+        owner_map = parse_owner_map(args.owner_map)
+        validate_owner_map(
+            owner_map,
+            options=options,
+            allowed_owners=team_members,
+            context=f"Debate {debate_id}",
+        )
+
+    will_broadcast_apply = bool(
+        isinstance(debate.get("task_id"), str)
+        and debate.get("task_id")
+        and not debate.get("applied")
+    )
+    notify_sender = resolve_notify_sender(
+        team_name=args.team_name,
+        requested_sender=args.notify_from,
+        fallback_sender=effective_decider,
+        reason="orchestrate-debate apply broadcast",
+        required=will_broadcast_apply,
+    )
 
     apply_note = apply_decision_to_task(
         args=args,
@@ -1032,8 +2083,8 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
         selected_option=selected_option,
         selected_status=args.status_on_apply,
         owner_map=owner_map,
-        applied_by=args.decider or str(debate.get("decider") or "lead"),
-        sender=args.notify_from,
+        applied_by=effective_decider,
+        sender=notify_sender,
     )
 
     write_json(debate_file(args.team_name), board)
@@ -1042,7 +2093,7 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
         team_name=args.team_name,
         event_type="orchestrate.completed",
         command="orchestrate-debate",
-        actor=args.decider or str(debate.get("decider") or "lead"),
+        actor=effective_decider,
         entity_type="debate",
         entity_id=debate_id,
         metadata={"selected_option": selected_option, "apply_note": apply_note},
@@ -1056,6 +2107,13 @@ def cmd_orchestrate_debate(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Team operations for codex-agent-teams.")
+    parser.add_argument(
+        "--team-root",
+        help=(
+            "Override team storage root. Defaults to nearest ancestor containing '.codex' "
+            "(or current directory) plus '/.codex/teams'. Can also be set via TEAM_OPS_ROOT."
+        ),
+    )
     parser.add_argument(
         "--monitoring",
         action="store_true",
@@ -1078,6 +2136,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--team-name", required=True)
     p_init.add_argument("--goal", required=True)
     p_init.add_argument("--members", required=True, help="Comma-separated members.")
+    p_init.add_argument(
+        "--reset",
+        action="store_true",
+        help="Explicitly reset existing team state (tasks/debates/messages/monitor).",
+    )
     p_init.set_defaults(func=cmd_init)
 
     p_add = sub.add_parser("add-task", help="Add a task to the shared board.")
@@ -1169,9 +2232,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_decide_debate.add_argument("--team-name", required=True)
     p_decide_debate.add_argument("--debate-id", required=True)
-    p_decide_debate.add_argument("--decider", default="lead")
+    p_decide_debate.add_argument(
+        "--decider",
+        default=None,
+        help="Decision actor. Defaults to the decider registered on the debate.",
+    )
     p_decide_debate.add_argument("--decision", help="Manual winning option.")
-    p_decide_debate.add_argument("--rationale", required=True)
+    p_decide_debate.add_argument(
+        "--rationale",
+        help="Decision rationale. Required when recording a new decision.",
+    )
     p_decide_debate.add_argument("--require-all-positions", action="store_true")
     p_decide_debate.add_argument("--apply", action="store_true")
     p_decide_debate.add_argument("--status-on-apply", default="in_progress")
@@ -1202,15 +2272,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Allow monitoring flags both before and after subcommand for ergonomic CLI usage.
     for child in sub.choices.values():
+        if "--team-root" not in child._option_string_actions:
+            child.add_argument(
+                "--team-root",
+                default=argparse.SUPPRESS,
+                help=(
+                    "Override team storage root. Defaults to nearest ancestor containing "
+                    "'.codex' (or current directory) plus '/.codex/teams'. "
+                    "Can also be set via TEAM_OPS_ROOT."
+                ),
+            )
         if "--monitoring" not in child._option_string_actions:
             child.add_argument(
                 "--monitoring",
                 action="store_true",
+                default=argparse.SUPPRESS,
                 help="Enable monitoring event logging for this command run.",
             )
         if "--monitor-log-file" not in child._option_string_actions:
             child.add_argument(
                 "--monitor-log-file",
+                default=argparse.SUPPRESS,
                 help=(
                     "Override monitor log path. Default: .codex/teams/<team>/monitor.jsonl. "
                     "Can also be set via TEAM_OPS_MONITOR_LOG_FILE."
@@ -1219,6 +2301,7 @@ def build_parser() -> argparse.ArgumentParser:
         if "--correlation-id" not in child._option_string_actions:
             child.add_argument(
                 "--correlation-id",
+                default=argparse.SUPPRESS,
                 help="Optional correlation id for linking events across command invocations.",
             )
 
@@ -1226,8 +2309,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    global TEAM_ROOT, TEAM_ROOT_IS_EXPLICIT
     parser = build_parser()
     args = parser.parse_args()
+    TEAM_ROOT_IS_EXPLICIT = bool(getattr(args, "team_root", None) or os.getenv(TEAM_ROOT_ENV))
+    TEAM_ROOT = resolve_team_root(getattr(args, "team_root", None))
+    ensure_team_root_usable(TEAM_ROOT)
     args._correlation_id = args.correlation_id or uuid.uuid4().hex
 
     if args.command == "orchestrate-debate" and not args.debate_id:
@@ -1238,7 +2325,27 @@ def main() -> int:
         if not args.members:
             raise SystemExit("--members is required when --debate-id is not provided.")
 
-    args.func(args)
+    mutating_commands = {
+        "init",
+        "add-task",
+        "claim",
+        "update-task",
+        "message",
+        "broadcast",
+        "start-debate",
+        "add-position",
+        "decide-debate",
+        "orchestrate-debate",
+    }
+    if args.command in mutating_commands:
+        # Some commands can auto-switch TEAM_ROOT via require_team(). Resolve that
+        # before locking so the lock is taken at the final canonical root.
+        if args.command != "init":
+            require_team(args.team_name)
+        with team_state_lock(args.team_name):
+            args.func(args)
+    else:
+        args.func(args)
     return 0
 
 
