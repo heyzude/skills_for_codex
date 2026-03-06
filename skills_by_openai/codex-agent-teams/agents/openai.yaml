@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Agent Teams"
+  short_description: "Coordinate lead + specialist sub-agents for parallel work"
+  default_prompt: "Use $codex-agent-teams to split this project into specialist agents and run a coordinated execution plan."
