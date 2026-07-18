@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create System Walkthrough"
+  short_description: "코드베이스를 인쇄 가능한 HTML 안내서로 설명"
+  default_prompt: "Use $create-system-walkthrough to create a self-contained, print-ready HTML walkthrough of this codebase."
